@@ -93,15 +93,17 @@ git remote add origin https://github.com/votre-compte/mini-cod.git
 git push -u origin main
 ```
 
-### 2. Déployer sur Cloudflare Pages
+### 2. Déployer sur Cloudflare (Pages ou Workers)
 1. Rendez-vous sur [dash.cloudflare.com](https://dash.cloudflare.com) et connectez votre compte.
-2. Allez dans **Workers & Pages** > **Create application** > **Pages** > **Connect to Git**.
+2. Allez dans **Workers & Pages** > **Create application** > **Pages** (ou **Workers**) > **Connect to Git**.
 3. Choisissez votre dépôt GitHub.
 4. Renseignez la configuration de build :
    - **Framework preset** : `Vite`
    - **Build command** : `npm run build`
    - **Build output directory** : `dist`
-5. Cliquez sur **Save and Deploy**. Le fichier `wrangler.toml` est déjà préconfiguré à la racine.
+5. Cliquez sur **Save and Deploy**.
+
+> **Note sur le fichier `wrangler.toml`** : Le fichier à la racine contient la directive `[assets] directory = "./dist"`, ce qui permet à Cloudflare de déployer les fichiers statiques sans erreur, que la commande exécutée soit `wrangler deploy` ou `wrangler pages deploy`. Le fichier `/public/_redirects` assure également la gestion des routes SPA.
 
 ---
 

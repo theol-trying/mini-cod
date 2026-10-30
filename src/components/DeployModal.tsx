@@ -13,7 +13,11 @@ export const DeployModal: React.FC<DeployModalProps> = ({ isOpen, onClose }) => 
 
   const wranglerConfig = `name = "mini-ops-retro-cod"
 compatibility_date = "2024-01-01"
-pages_build_output_dir = "dist"`;
+pages_build_output_dir = "dist"
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"`;
 
   const copyConfig = () => {
     navigator.clipboard.writeText(wranglerConfig);
