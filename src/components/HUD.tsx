@@ -38,6 +38,7 @@ interface HUDProps {
   onFireTouch: (down: boolean) => void;
   onAdsTouch: () => void;
   onJumpTouch: () => void;
+  onCrouchTouch?: () => void;
   onReloadTouch: () => void;
   onGrenadeTouch: () => void;
   onSwitchTouch: () => void;
@@ -70,6 +71,7 @@ export const HUD: React.FC<HUDProps> = ({
   onFireTouch,
   onAdsTouch,
   onJumpTouch,
+  onCrouchTouch,
   onReloadTouch,
   onGrenadeTouch,
   onSwitchTouch,
@@ -369,6 +371,14 @@ export const HUD: React.FC<HUDProps> = ({
                 className="w-12 h-12 rounded-full bg-neutral-800/80 active:bg-neutral-700 text-white border border-neutral-600 flex items-center justify-center cursor-pointer shadow-lg font-bold text-xs"
               >
                 SAUT
+              </button>
+
+              <button
+                onClick={onCrouchTouch}
+                className="w-12 h-12 rounded-full bg-neutral-800/80 active:bg-neutral-700 text-amber-400 border border-neutral-600 flex items-center justify-center cursor-pointer shadow-lg font-bold text-xs"
+                title="Accroupi / Glissade"
+              >
+                GLISSE
               </button>
 
               <button

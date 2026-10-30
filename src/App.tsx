@@ -67,7 +67,9 @@ export default function App() {
   const [selectedMap, setSelectedMap] = useState<MapId>('nuketown');
   const [selectedMode, setSelectedMode] = useState<GameMode>('shootout');
   const [matchFormat, setMatchFormat] = useState<MatchFormat>('teams');
-  const [playerName, setPlayerName] = useState('Opérateur_1');
+  const [playerName, setPlayerName] = useState(() => {
+    return localStorage.getItem('mini_cod_player_name') || 'Opérateur_' + Math.floor(100 + Math.random() * 900);
+  });
 
   // Modals
   const [isArmoryOpen, setIsArmoryOpen] = useState(false);
@@ -113,6 +115,13 @@ export default function App() {
 
   const canvasMountRef = useRef<HTMLDivElement>(null);
   const engineRef = useRef<GameEngine | null>(null);
+  const launchGameRef = useRef<(mapId: MapId, format: MatchFormat) => void>(() => {});
+
+  const handleUpdatePlayerName = (name: string) => {
+    setPlayerName(name);
+    localStorage.setItem('mini_cod_player_name', name);
+    networkRef.current?.updatePlayerName(name);
+  };
 
   useEffect(() => {
     setIsTouchDevice('ontouchstart' in window || navigator.maxTouchPoints > 0);
@@ -141,16 +150,38 @@ export default function App() {
         setSelectedMap(packet.payload.mapId);
         setMatchFormat(packet.payload.format);
         setIsRoomModalOpen(false);
-        launchGame(packet.payload.mapId, packet.payload.format);
+        launchGameRef.current(packet.payload.mapId, packet.payload.format);
       } else if (packet.type === 'PLAYER_STATE') {
         if (engineRef.current && packet.senderId !== net.localPeerId) {
           const peer = net.roomState?.peers.find((p) => p.id === packet.senderId);
+          const peerName = packet.payload.name || peer?.name || 'Opérateur';
+          const peerTeam = packet.payload.team || peer?.team || (net.isHost ? 'enemies' : 'allies');
           engineRef.current.updateRemotePeer(
             packet.senderId,
-            peer?.name || 'Joueur',
-            peer?.team || 'enemies',
+            peerName,
+            peerTeam,
             packet.payload.pos,
             packet.payload.rot[0]
+          );
+        }
+      } else if (packet.type === 'PLAYER_FIRE') {
+        if (engineRef.current && packet.senderId !== net.localPeerId) {
+          engineRef.current.handleRemotePlayerFire(
+            packet.senderId,
+            packet.payload.origin,
+            packet.payload.direction,
+            packet.payload.weapon
+          );
+        }
+      } else if (packet.type === 'PLAYER_DAMAGE') {
+        if (packet.payload.targetId === net.localPeerId && engineRef.current) {
+          const attacker = net.roomState?.peers.find((p) => p.id === packet.senderId);
+          engineRef.current.takeDamage(
+            packet.payload.damage,
+            packet.payload.isHeadshot,
+            packet.payload.weapon,
+            packet.senderId,
+            attacker?.name
           );
         }
       }
@@ -193,6 +224,7 @@ export default function App() {
   };
 
   const launchGame = (mapId: MapId, format: MatchFormat) => {
+    launchGameRef.current = launchGame;
     sounds.playClick();
     setGameState('playing');
     setPostMatchData(null);
@@ -236,8 +268,7 @@ export default function App() {
           onStreakChange: (s) => {
             setStreak(s);
           },
-          onPlayerStatsChange: (stats) => {
-            setScoreboardPlayers(stats);
+          onPlayerStatsChange: () => {
             const p = engineRef.current;
             if (p) {
               setPlayerPos({ x: p.playerPos.x, z: p.playerPos.z });
@@ -245,6 +276,36 @@ export default function App() {
               setMatchTime(p.matchTimeRemaining);
               setIsAiming(p.isAiming);
               setMatchScore(p.score);
+
+              const localStat: PlayerStats = {
+                id: 'local_player',
+                name: `${playerName} (Vous)`,
+                team: p.playerTeam,
+                kills: p.kills,
+                deaths: p.deaths,
+                assists: p.assists,
+                score: p.score,
+                streak: p.currentStreak,
+                highestStreak: p.highestStreak,
+                ping: 12
+              };
+
+              const remotePeersStats: PlayerStats[] = (networkRef.current?.roomState?.peers || [])
+                .filter((peer) => peer.id !== networkRef.current?.localPeerId)
+                .map((peer) => ({
+                  id: peer.id,
+                  name: peer.name,
+                  team: peer.team,
+                  kills: 0,
+                  deaths: 0,
+                  assists: 0,
+                  score: 0,
+                  streak: 0,
+                  highestStreak: 0,
+                  ping: peer.ping || 16
+                }));
+
+              setScoreboardPlayers([localStat, ...remotePeersStats]);
 
               if (p.targetManager) {
                 setTargetPositions(
@@ -256,8 +317,8 @@ export default function App() {
                 );
               }
 
-              // Send network position packet to peers
-              if (networkRef.current && roomState) {
+              // Send network position packet to peers reliably
+              if (networkRef.current && (networkRef.current.roomCode || networkRef.current.roomState)) {
                 networkRef.current.sendPlayerState({
                   pos: [p.playerPos.x, p.playerPos.y, p.playerPos.z],
                   rot: [p.yaw, p.pitch],
@@ -293,6 +354,25 @@ export default function App() {
           onWeaponUpgrade: (bannerText) => {
             setWeaponUpgradeBanner(bannerText);
             setTimeout(() => setWeaponUpgradeBanner(null), 3000);
+          },
+          onRemoteFire: (origin, dir, weapon) => {
+            if (networkRef.current && networkRef.current.roomCode) {
+              networkRef.current.sendPlayerFire({
+                origin,
+                direction: dir,
+                weapon
+              });
+            }
+          },
+          onPlayerDamage: (targetId, damage, isHeadshot, weapon) => {
+            if (networkRef.current && networkRef.current.roomCode) {
+              networkRef.current.sendPlayerDamage({
+                targetId,
+                damage,
+                isHeadshot,
+                weapon
+              });
+            }
           }
         }
       );
@@ -588,7 +668,7 @@ export default function App() {
 
               <div className="mt-4 pt-3 border-t border-neutral-800 text-[11px] text-neutral-400 flex justify-between">
                 <span>Contrôles :</span>
-                <span className="text-white font-bold">Z, Q, S, D ou W, A, S, D • [E] Ramasser</span>
+                <span className="text-white font-bold">Z, Q, S, D • [Shift] Sprint • [C] Glissade/Accroupi • [E] Ramasser</span>
               </div>
             </div>
           </div>
@@ -656,6 +736,7 @@ export default function App() {
             onFireTouch={(down) => engineRef.current?.touchFire(down)}
             onAdsTouch={() => engineRef.current?.touchAdsToggle()}
             onJumpTouch={() => engineRef.current?.touchJump()}
+            onCrouchTouch={() => engineRef.current?.touchCrouchToggle()}
             onReloadTouch={() => engineRef.current?.touchReload()}
             onGrenadeTouch={() => engineRef.current?.touchGrenade()}
             onSwitchTouch={() => engineRef.current?.switchWeapon()}
@@ -688,7 +769,7 @@ export default function App() {
         roomState={roomState}
         isHost={isNetworkHost}
         localPlayerName={playerName}
-        onUpdatePlayerName={setPlayerName}
+        onUpdatePlayerName={handleUpdatePlayerName}
         onCreateRoom={handleCreateRoom}
         onJoinRoom={handleJoinRoom}
         onStartMatch={handleStartRoomMatch}

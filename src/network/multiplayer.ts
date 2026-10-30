@@ -7,6 +7,7 @@ export interface NetworkPacket {
     | 'ROOM_STATE'
     | 'SET_READY'
     | 'SET_TEAM'
+    | 'SET_NAME'
     | 'START_MATCH'
     | 'PLAYER_STATE'
     | 'PLAYER_FIRE'
@@ -18,6 +19,14 @@ export interface NetworkPacket {
 }
 
 export type NetworkEventCallback = (packet: NetworkPacket) => void;
+
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun3.l.google.com:19302' },
+  { urls: 'stun:stun4.l.google.com:19302' }
+];
 
 export class MultiplayerNetwork {
   private peer: Peer | null = null;
@@ -34,12 +43,40 @@ export class MultiplayerNetwork {
   private onEventCallback: NetworkEventCallback | null = null;
 
   constructor(playerName: string) {
-    this.localPlayerName = playerName;
+    this.localPlayerName = playerName || 'Opérateur';
     this.localPeerId = 'player_' + Math.random().toString(36).substring(2, 8);
   }
 
   public setOnEvent(cb: NetworkEventCallback) {
     this.onEventCallback = cb;
+  }
+
+  public getLocalTeam(): Team {
+    if (!this.roomState) return this.isHost ? 'allies' : 'enemies';
+    const me = this.roomState.peers.find((p) => p.id === this.localPeerId);
+    return me?.team || (this.isHost ? 'allies' : 'enemies');
+  }
+
+  public updatePlayerName(newName: string) {
+    const trimmed = newName.trim();
+    if (!trimmed) return;
+    this.localPlayerName = trimmed;
+
+    if (this.roomState) {
+      const me = this.roomState.peers.find((p) => p.id === this.localPeerId);
+      if (me) {
+        me.name = trimmed;
+      }
+      if (this.isHost) {
+        this.broadcastRoomState();
+      } else {
+        this.sendPacket({
+          type: 'SET_NAME',
+          senderId: this.localPeerId,
+          payload: { name: trimmed }
+        });
+      }
+    }
   }
 
   // Create a new room as Host
@@ -50,16 +87,18 @@ export class MultiplayerNetwork {
   ): Promise<{ success: boolean; error?: string }> {
     this.isHost = true;
     this.roomCode = roomCode.toUpperCase().trim();
+    const hostPeerId = `mcod-${this.roomCode}`;
+    this.localPeerId = hostPeerId;
 
     this.roomState = {
       code: this.roomCode,
       format,
       mapId,
       isStarted: false,
-      hostId: this.localPeerId,
+      hostId: hostPeerId,
       peers: [
         {
-          id: this.localPeerId,
+          id: hostPeerId,
           name: this.localPlayerName,
           team: 'allies',
           isHost: true,
@@ -76,13 +115,22 @@ export class MultiplayerNetwork {
 
     return new Promise((resolve) => {
       try {
-        const hostPeerId = `mcod-${this.roomCode}`;
         this.peer = new Peer(hostPeerId, {
-          debug: 1
+          debug: 1,
+          config: {
+            iceServers: ICE_SERVERS
+          }
         });
 
         this.peer.on('open', (id) => {
           this.localPeerId = id;
+          if (this.roomState) {
+            this.roomState.hostId = id;
+            if (this.roomState.peers.length > 0) {
+              this.roomState.peers[0].id = id;
+              this.roomState.peers[0].name = this.localPlayerName;
+            }
+          }
           resolve({ success: true });
         });
 
@@ -91,7 +139,6 @@ export class MultiplayerNetwork {
         });
 
         this.peer.on('error', (err) => {
-          // If PeerJS cloud is unreachable or ID taken, BroadcastChannel fallback still operates smoothly
           console.warn('PeerJS note:', err.message);
           resolve({ success: true });
         });
@@ -110,17 +157,19 @@ export class MultiplayerNetwork {
     return new Promise((resolve) => {
       try {
         this.peer = new Peer({
-          debug: 1
+          debug: 1,
+          config: {
+            iceServers: ICE_SERVERS
+          }
         });
 
         this.peer.on('open', (myId) => {
           this.localPeerId = myId;
           const hostPeerId = `mcod-${this.roomCode}`;
           const conn = this.peer!.connect(hostPeerId, { reliable: true });
+          this.hostConnection = conn;
 
-          conn.on('open', () => {
-            this.hostConnection = conn;
-            // Send Join Request
+          const onConnected = () => {
             this.sendPacket({
               type: 'JOIN_REQUEST',
               senderId: this.localPeerId,
@@ -133,7 +182,13 @@ export class MultiplayerNetwork {
               }
             });
             resolve({ success: true });
-          });
+          };
+
+          if (conn.open) {
+            onConnected();
+          } else {
+            conn.on('open', onConnected);
+          }
 
           conn.on('data', (data: any) => {
             this.handlePacket(data as NetworkPacket);
@@ -141,16 +196,17 @@ export class MultiplayerNetwork {
 
           conn.on('error', (e) => {
             console.warn('Connection warning:', e);
-            resolve({ success: true }); // Fallback on BroadcastChannel
+            resolve({ success: true });
           });
 
           // Fallback timeout in case WebRTC takes time
           setTimeout(() => {
             resolve({ success: true });
-          }, 1500);
+          }, 2500);
         });
 
-        this.peer.on('error', () => {
+        this.peer.on('error', (err) => {
+          console.warn('Peer error:', err);
           resolve({ success: true });
         });
       } catch {
@@ -174,20 +230,45 @@ export class MultiplayerNetwork {
   }
 
   private handleIncomingConnection(conn: DataConnection) {
-    conn.on('open', () => {
+    const onOpen = () => {
       this.connections.set(conn.peer, conn);
 
       // Send initial room state
       if (this.roomState) {
-        conn.send({
-          type: 'ROOM_STATE',
-          senderId: this.localPeerId,
-          payload: this.roomState
-        });
+        try {
+          conn.send({
+            type: 'ROOM_STATE',
+            senderId: this.localPeerId,
+            payload: this.roomState
+          });
+
+          // If game already started, catch up the joining player immediately
+          if (this.roomState.isStarted) {
+            conn.send({
+              type: 'START_MATCH',
+              senderId: this.localPeerId,
+              payload: {
+                mapId: this.roomState.mapId,
+                format: this.roomState.format
+              }
+            });
+          }
+        } catch (e) {
+          console.warn('Send error on incoming connection:', e);
+        }
       }
-    });
+    };
+
+    if (conn.open) {
+      onOpen();
+    } else {
+      conn.on('open', onOpen);
+    }
 
     conn.on('data', (data: any) => {
+      if (!this.connections.has(conn.peer)) {
+        this.connections.set(conn.peer, conn);
+      }
       this.handlePacket(data as NetworkPacket);
     });
 
@@ -198,14 +279,19 @@ export class MultiplayerNetwork {
         this.broadcastRoomState();
       }
     });
+
+    conn.on('error', (err) => {
+      console.warn('Connection error with peer:', conn.peer, err);
+    });
   }
 
   private handlePacket(packet: NetworkPacket) {
     if (this.isHost) {
       if (packet.type === 'JOIN_REQUEST') {
         if (this.roomState) {
+          const peerId = packet.payload.id || packet.senderId;
           const newPeer: NetworkPeerInfo = {
-            id: packet.payload.id,
+            id: peerId,
             name: packet.payload.name || 'Soldat',
             team: this.roomState.format === 'teams' ? 'enemies' : 'allies',
             isHost: false,
@@ -215,10 +301,24 @@ export class MultiplayerNetwork {
             ping: 15
           };
 
-          if (!this.roomState.peers.some((p) => p.id === newPeer.id)) {
+          const existingIndex = this.roomState.peers.findIndex((p) => p.id === peerId);
+          if (existingIndex >= 0) {
+            this.roomState.peers[existingIndex] = {
+              ...this.roomState.peers[existingIndex],
+              ...newPeer
+            };
+          } else {
             this.roomState.peers.push(newPeer);
           }
           this.broadcastRoomState();
+        }
+      } else if (packet.type === 'SET_NAME') {
+        if (this.roomState) {
+          const p = this.roomState.peers.find((item) => item.id === packet.senderId);
+          if (p) {
+            p.name = packet.payload.name;
+            this.broadcastRoomState();
+          }
         }
       } else if (packet.type === 'SET_READY') {
         if (this.roomState) {
@@ -258,14 +358,22 @@ export class MultiplayerNetwork {
     if (this.isHost) {
       this.connections.forEach((conn) => {
         if (conn.open) {
-          conn.send(packet);
+          try {
+            conn.send(packet);
+          } catch {
+            // ignore
+          }
         }
       });
     } else if (this.hostConnection && this.hostConnection.open) {
-      this.hostConnection.send(packet);
+      try {
+        this.hostConnection.send(packet);
+      } catch {
+        // ignore
+      }
     }
 
-    // 2. BroadcastChannel
+    // 2. BroadcastChannel (for testing in multiple tabs on same machine)
     if (this.broadcastChannel) {
       try {
         this.broadcastChannel.postMessage(packet);
@@ -278,7 +386,11 @@ export class MultiplayerNetwork {
   private relayToOthers(packet: NetworkPacket, ignoreId: string) {
     this.connections.forEach((conn, id) => {
       if (id !== ignoreId && conn.open) {
-        conn.send(packet);
+        try {
+          conn.send(packet);
+        } catch {
+          // ignore
+        }
       }
     });
   }
@@ -332,7 +444,11 @@ export class MultiplayerNetwork {
     this.sendPacket({
       type: 'PLAYER_STATE',
       senderId: this.localPeerId,
-      payload: state
+      payload: {
+        ...state,
+        name: this.localPlayerName,
+        team: this.getLocalTeam()
+      }
     });
   }
 

@@ -41,6 +41,7 @@ export interface GameEngineCallbacks {
   onPickupPrompt: (prompt: string | null) => void;
   onWeaponUpgrade: (weaponName: string) => void;
   onRemoteFire?: (origin: [number, number, number], dir: [number, number, number], weapon: WeaponId) => void;
+  onPlayerDamage?: (targetId: string, damage: number, isHeadshot: boolean, weapon: WeaponId) => void;
 }
 
 export class GameEngine {
@@ -119,6 +120,11 @@ export class GameEngine {
   public isAiming = false;
   public isSprinting = false;
   public isCrouching = false;
+  public isSliding = false;
+  private slideTimer = 0;
+  private readonly slideDuration = 0.85;
+  private slideVelocity = new THREE.Vector3();
+  private currentEyeHeight = 1.7;
   private keys: Record<string, boolean> = {};
   public isPointerLocked = false;
   public mouseSensitivity = 0.0022;
@@ -266,6 +272,8 @@ export class GameEngine {
       this.tryTakeNearbyPickup();
     } else if (e.code === 'KeyR' || e.key.toLowerCase() === 'r') {
       this.reloadWeapon();
+    } else if (e.code === 'KeyC' || e.key.toLowerCase() === 'c' || e.code === 'ControlLeft') {
+      this.handleCrouchOrSlide();
     } else if (e.code === 'KeyQ' || e.key.toLowerCase() === 'q') {
       if (!this.keys['KeyA']) {
         this.switchWeapon();
@@ -288,6 +296,27 @@ export class GameEngine {
       this.activateKillstreak('nuke');
     }
   };
+
+  public handleCrouchOrSlide() {
+    if (this.isDead || this.isMatchOver) return;
+
+    if (this.isSliding) {
+      // Cancel slide directly into crouch
+      this.isSliding = false;
+      this.isCrouching = true;
+    } else if (this.isSprinting && this.isGrounded) {
+      // Tactical slide in current sprint direction!
+      this.isSliding = true;
+      this.isCrouching = true;
+      this.slideTimer = this.slideDuration;
+      _forward.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw)).normalize();
+      this.slideVelocity.copy(_forward);
+      sounds.playSlide();
+    } else {
+      // Toggle crouch
+      this.isCrouching = !this.isCrouching;
+    }
+  }
 
   private onKeyUp = (e: KeyboardEvent) => {
     this.keys[e.code] = false;
@@ -337,9 +366,17 @@ export class GameEngine {
 
   public touchJump() {
     if (this.isGrounded && !this.isDead) {
+      if (this.isSliding) {
+        this.isSliding = false;
+      }
+      this.isCrouching = false;
       this.playerVel.y = 8.5;
       this.isGrounded = false;
     }
+  }
+
+  public touchCrouchToggle() {
+    this.handleCrouchOrSlide();
   }
 
   public touchReload() {
@@ -353,6 +390,9 @@ export class GameEngine {
   private spawnPlayer() {
     this.playerHealth = 100;
     this.isDead = false;
+    this.isSliding = false;
+    this.isCrouching = false;
+    this.currentEyeHeight = 1.7;
     this.respawnTimer = 0;
     const spawns = this.playerTeam === 'allies' ? this.mapConfig.alliesSpawns : this.mapConfig.enemiesSpawns;
     const sp = spawns[0] || this.mapConfig.alliesSpawns[0];
@@ -618,6 +658,8 @@ export class GameEngine {
     const pellets = wDef.pellets || 1;
 
     const targetObjects = this.targetManager.getTargetMeshes();
+    const remoteObjects = this.getRemotePlayerMeshes();
+    const shootableObjects = [...targetObjects, ...remoteObjects];
 
     for (let p = 0; p < pellets; p++) {
       _rayDir.copy(_forward);
@@ -631,7 +673,7 @@ export class GameEngine {
       this.raycaster.set(this.camera.position, _rayDir);
       this.raycaster.far = 100;
 
-      const hits = this.raycaster.intersectObjects(targetObjects, false);
+      const hits = this.raycaster.intersectObjects(shootableObjects, false);
       let impactPoint: THREE.Vector3;
 
       if (hits.length > 0) {
@@ -639,21 +681,37 @@ export class GameEngine {
         impactPoint = hit.point;
         const targetPart = hit.object as any;
         const isHead = !!targetPart.isHead;
-        const targetId = targetPart.targetId;
 
-        const dmg = (wDef.damage / pellets) * (isHead ? wDef.headshotMultiplier : 1.0);
-        const { killed } = this.targetManager.hitTarget(targetId, dmg, isHead, hit.point);
+        if (targetPart.peerId) {
+          const targetPeerId = targetPart.peerId as string;
+          const dmg = (wDef.damage / pellets) * (isHead ? wDef.headshotMultiplier : 1.0);
+          sounds.playHitmarker(isHead, false);
+          this.callbacks.onHitmarker({
+            id: Math.random().toString(),
+            isFatal: false,
+            isHeadshot: isHead,
+            time: Date.now()
+          });
 
-        sounds.playHitmarker(isHead, killed);
-        this.callbacks.onHitmarker({
-          id: Math.random().toString(),
-          isFatal: killed,
-          isHeadshot: isHead,
-          time: Date.now()
-        });
+          if (this.callbacks.onPlayerDamage) {
+            this.callbacks.onPlayerDamage(targetPeerId, dmg, isHead, this.currentWeaponId);
+          }
+        } else if (targetPart.targetId) {
+          const targetId = targetPart.targetId;
+          const dmg = (wDef.damage / pellets) * (isHead ? wDef.headshotMultiplier : 1.0);
+          const { killed } = this.targetManager.hitTarget(targetId, dmg, isHead, hit.point);
 
-        if (killed) {
-          this.handleTargetDestroyed(isHead, this.currentWeaponId);
+          sounds.playHitmarker(isHead, killed);
+          this.callbacks.onHitmarker({
+            id: Math.random().toString(),
+            isFatal: killed,
+            isHeadshot: isHead,
+            time: Date.now()
+          });
+
+          if (killed) {
+            this.handleTargetDestroyed(isHead, this.currentWeaponId);
+          }
         }
       } else {
         impactPoint = this.camera.position.clone().addScaledVector(_rayDir, 60);
@@ -661,6 +719,38 @@ export class GameEngine {
 
       this.effects.addBulletTracer(muzzlePos, impactPoint);
     }
+  }
+
+  private createNameSprite(name: string, team: Team): THREE.Sprite {
+    const nameCanvas = document.createElement('canvas');
+    nameCanvas.width = 256;
+    nameCanvas.height = 64;
+    const nCtx = nameCanvas.getContext('2d')!;
+    nCtx.fillStyle = 'rgba(0,0,0,0.75)';
+    nCtx.roundRect(10, 10, 236, 44, 8);
+    nCtx.fill();
+    nCtx.fillStyle = team === 'allies' ? '#60a5fa' : '#f87171';
+    nCtx.font = 'bold 22px sans-serif';
+    nCtx.textAlign = 'center';
+    nCtx.fillText((name || 'Opérateur').slice(0, 14), 128, 38);
+
+    const nameTex = new THREE.CanvasTexture(nameCanvas);
+    const nameSprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: nameTex }));
+    nameSprite.position.y = 2.15;
+    nameSprite.scale.set(1.4, 0.35, 1);
+    return nameSprite;
+  }
+
+  public getRemotePlayerMeshes(): THREE.Object3D[] {
+    const meshes: THREE.Object3D[] = [];
+    this.remotePlayerMeshes.forEach((group) => {
+      group.traverse((child) => {
+        if ((child as any).peerId) {
+          meshes.push(child);
+        }
+      });
+    });
+    return meshes;
   }
 
   // Update peer player 3D avatars for WebRTC P2P multiplayer with realistic tactical operator model
@@ -674,6 +764,9 @@ export class GameEngine {
     let mesh = this.remotePlayerMeshes.get(peerId);
     if (!mesh) {
       mesh = new THREE.Group();
+      mesh.userData.name = name;
+      mesh.userData.team = team;
+
       const teamColor = team === 'allies' ? 0x2563eb : 0xdc2626;
 
       const camoMat = new THREE.MeshStandardMaterial({
@@ -704,18 +797,20 @@ export class GameEngine {
         roughness: 0.35
       });
 
-      // 1. Combat Boots
+      // 1. Combat Boots & Legs
       const bootMat = new THREE.MeshStandardMaterial({ color: 0x111215, roughness: 0.9 });
       [-0.18, 0.18].forEach((bx) => {
         const boot = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.22, 0.3), bootMat);
         boot.position.set(bx, 0.11, 0.04);
         boot.castShadow = true;
+        (boot as any).peerId = peerId;
         mesh!.add(boot);
 
         // Legs with kneepads
         const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.11, 0.65, 8), camoMat);
         leg.position.set(bx, 0.48, 0);
         leg.castShadow = true;
+        (leg as any).peerId = peerId;
         mesh!.add(leg);
 
         const kneepad = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.14, 0.08), vestMat);
@@ -727,11 +822,13 @@ export class GameEngine {
       const torso = new THREE.Mesh(new THREE.BoxGeometry(0.54, 0.66, 0.34), camoMat);
       torso.position.y = 1.12;
       torso.castShadow = true;
+      (torso as any).peerId = peerId;
       mesh.add(torso);
 
       const vest = new THREE.Mesh(new THREE.BoxGeometry(0.56, 0.52, 0.38), vestMat);
       vest.position.y = 1.18;
       vest.castShadow = true;
+      (vest as any).peerId = peerId;
       mesh.add(vest);
 
       // Mag Pouches on Chest
@@ -747,6 +844,7 @@ export class GameEngine {
         arm.position.set(ax, 1.15, 0.05);
         arm.rotation.x = 0.5;
         arm.castShadow = true;
+        (arm as any).peerId = peerId;
         mesh!.add(arm);
 
         const armband = new THREE.Mesh(new THREE.CylinderGeometry(0.098, 0.098, 0.14, 8), teamPatchMat);
@@ -768,11 +866,15 @@ export class GameEngine {
       const head = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.26, 0.25), skinMat);
       head.position.y = 1.62;
       head.castShadow = true;
+      (head as any).peerId = peerId;
+      (head as any).isHead = true;
       mesh.add(head);
 
       const helmet = new THREE.Mesh(new THREE.SphereGeometry(0.19, 12, 10, 0, Math.PI * 2, 0, Math.PI / 1.7), camoMat);
       helmet.position.set(0, 1.68, 0);
       helmet.castShadow = true;
+      (helmet as any).peerId = peerId;
+      (helmet as any).isHead = true;
       mesh.add(helmet);
 
       // NVG Mount Plate on Helmet Forehead
@@ -807,30 +909,91 @@ export class GameEngine {
       mesh.add(gunGroup);
 
       // 5. Overhead 3D Name Tag Canvas Billboard
-      const nameCanvas = document.createElement('canvas');
-      nameCanvas.width = 256;
-      nameCanvas.height = 64;
-      const nCtx = nameCanvas.getContext('2d')!;
-      nCtx.fillStyle = 'rgba(0,0,0,0.7)';
-      nCtx.roundRect(10, 10, 236, 44, 8);
-      nCtx.fill();
-      nCtx.fillStyle = team === 'allies' ? '#60a5fa' : '#f87171';
-      nCtx.font = 'bold 22px sans-serif';
-      nCtx.textAlign = 'center';
-      nCtx.fillText(name.slice(0, 14), 128, 38);
-
-      const nameTex = new THREE.CanvasTexture(nameCanvas);
-      const nameSprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: nameTex }));
-      nameSprite.position.y = 2.15;
-      nameSprite.scale.set(1.4, 0.35, 1);
+      const nameSprite = this.createNameSprite(name, team);
       mesh.add(nameSprite);
+      mesh.userData.nameSprite = nameSprite;
 
       this.scene.add(mesh);
       this.remotePlayerMeshes.set(peerId, mesh);
+    } else {
+      // Dynamic update of overhead nameplate if name or team changed
+      if (mesh.userData.name !== name || mesh.userData.team !== team) {
+        if (mesh.userData.nameSprite) {
+          mesh.remove(mesh.userData.nameSprite);
+        }
+        const updatedSprite = this.createNameSprite(name, team);
+        mesh.add(updatedSprite);
+        mesh.userData.nameSprite = updatedSprite;
+        mesh.userData.name = name;
+        mesh.userData.team = team;
+      }
     }
 
-    mesh.position.set(pos[0], pos[1] - 1.7, pos[2]);
+    mesh.visible = true;
+    mesh.position.set(pos[0], Math.max(0, pos[1] - 1.7), pos[2]);
     mesh.rotation.y = yaw;
+    if (pos[1] < 1.35) {
+      mesh.scale.set(1, 0.65, 1);
+    } else {
+      mesh.scale.set(1, 1, 1);
+    }
+  }
+
+  public takeDamage(
+    amount: number,
+    isHeadshot: boolean,
+    weapon: WeaponId,
+    attackerId?: string,
+    attackerName?: string
+  ) {
+    if (this.isDead || this.isMatchOver) return;
+
+    this.playerHealth = Math.max(0, this.playerHealth - amount);
+    this.callbacks.onHealthChange(this.playerHealth, this.maxHealth);
+    sounds.playHurt();
+
+    if (this.playerHealth <= 0) {
+      this.isDead = true;
+      this.isSliding = false;
+      this.isCrouching = false;
+      this.deaths++;
+      this.currentStreak = 0;
+      this.callbacks.onStreakChange(0);
+      sounds.playDeath();
+
+      const feed: KillfeedEntry = {
+        id: Math.random().toString(),
+        killer: attackerName || 'Opérateur Ennemi',
+        killerTeam: this.playerTeam === 'allies' ? 'enemies' : 'allies',
+        victim: 'Opérateur (Vous)',
+        victimTeam: this.playerTeam,
+        weapon,
+        isHeadshot,
+        time: Date.now()
+      };
+      this.callbacks.onKillfeed(feed);
+
+      setTimeout(() => {
+        if (!this.isMatchOver) {
+          this.spawnPlayer();
+        }
+      }, 3000);
+    }
+  }
+
+  public handleRemotePlayerFire(
+    peerId: string,
+    origin: [number, number, number],
+    direction: [number, number, number],
+    weapon: WeaponId
+  ) {
+    const originVec = new THREE.Vector3(...origin);
+    const dirVec = new THREE.Vector3(...direction).normalize();
+    const impactPoint = originVec.clone().addScaledVector(dirVec, 40);
+
+    sounds.playGunshot(weapon === 'knife' ? 'm4a1' : weapon);
+    this.effects.triggerMuzzleFlash(originVec);
+    this.effects.addBulletTracer(originVec, impactPoint);
   }
 
   public removeRemotePeer(peerId: string) {
@@ -860,24 +1023,53 @@ export class GameEngine {
     if (this.touchMoveY !== 0) moveF = -this.touchMoveY;
     if (this.touchMoveX !== 0) moveR = this.touchMoveX;
 
-    this.isSprinting = !!(this.keys['ShiftLeft'] || this.keys['ShiftRight']) && moveF > 0 && !this.isAiming;
-    this.isCrouching = !!(this.keys['KeyC'] || this.keys['ControlLeft']);
+    const hasSprintKey = !!(this.keys['ShiftLeft'] || this.keys['ShiftRight']);
+    const isMovingForward = moveF > 0;
 
-    const baseSpeed = this.isSprinting ? 9.5 : this.isCrouching ? 3.5 : 6.2;
-    const targetHeight = this.isCrouching ? 1.05 : 1.7;
+    // Sprinting breaks crouch (natural tactical movement)
+    if (this.isCrouching && !this.isSliding && hasSprintKey && isMovingForward) {
+      this.isCrouching = false;
+    }
+
+    this.isSprinting = hasSprintKey && isMovingForward && !this.isAiming && !this.isCrouching && !this.isSliding;
 
     _forward.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw)).normalize();
     _right.set(Math.cos(this.yaw), 0, -Math.sin(this.yaw)).normalize();
 
-    _moveDir.set(0, 0, 0);
-    _moveDir.addScaledVector(_forward, moveF);
-    _moveDir.addScaledVector(_right, moveR);
-    if (_moveDir.lengthSq() > 1) _moveDir.normalize();
+    // Smooth eye-height interpolation: slide (0.85m), crouch (1.05m), stand (1.7m)
+    const targetEyeHeight = this.isSliding ? 0.85 : this.isCrouching ? 1.05 : 1.7;
+    this.currentEyeHeight = THREE.MathUtils.damp(this.currentEyeHeight, targetEyeHeight, 14, delta);
 
-    this.playerVel.x = _moveDir.x * baseSpeed;
-    this.playerVel.z = _moveDir.z * baseSpeed;
+    if (this.isSliding) {
+      this.slideTimer -= delta;
+      // Exponential falloff from 13.0 m/s down to crouch speed 3.5 m/s
+      const t = Math.max(0, this.slideTimer / this.slideDuration);
+      const slideSpeed = 3.5 + 9.5 * (t * t);
+
+      this.playerVel.x = this.slideVelocity.x * slideSpeed;
+      this.playerVel.z = this.slideVelocity.z * slideSpeed;
+
+      if (this.slideTimer <= 0) {
+        this.isSliding = false;
+        this.isCrouching = true;
+      }
+    } else {
+      const baseSpeed = this.isSprinting ? 9.5 : this.isCrouching ? 3.5 : 6.2;
+      _moveDir.set(0, 0, 0);
+      _moveDir.addScaledVector(_forward, moveF);
+      _moveDir.addScaledVector(_right, moveR);
+      if (_moveDir.lengthSq() > 1) _moveDir.normalize();
+
+      this.playerVel.x = _moveDir.x * baseSpeed;
+      this.playerVel.z = _moveDir.z * baseSpeed;
+    }
 
     if (this.keys['Space'] && this.isGrounded) {
+      if (this.isSliding) {
+        // Slide-cancel jump (tactical COD momentum jump)
+        this.isSliding = false;
+      }
+      this.isCrouching = false;
       this.playerVel.y = 8.5;
       this.isGrounded = false;
     }
@@ -885,14 +1077,15 @@ export class GameEngine {
     this.playerVel.y -= 22 * delta;
     this.playerPos.addScaledVector(this.playerVel, delta);
 
-    if (this.playerPos.y <= targetHeight) {
-      this.playerPos.y = targetHeight;
+    if (this.playerPos.y <= this.currentEyeHeight) {
+      this.playerPos.y = this.currentEyeHeight;
       this.playerVel.y = 0;
       this.isGrounded = true;
     }
 
     // Map obstacle collision resolution
     const radius = 0.45;
+    let hitObstacle = false;
     for (const box of this.mapConfig.collisionBoxes) {
       if (
         this.playerPos.x + radius > box.minX &&
@@ -901,6 +1094,7 @@ export class GameEngine {
         this.playerPos.z - radius < box.maxZ &&
         this.playerPos.y < box.maxY
       ) {
+        hitObstacle = true;
         const dx1 = this.playerPos.x - box.minX;
         const dx2 = box.maxX - this.playerPos.x;
         const dz1 = this.playerPos.z - box.minZ;
@@ -914,20 +1108,28 @@ export class GameEngine {
       }
     }
 
+    if (hitObstacle && this.isSliding) {
+      this.isSliding = false;
+      this.isCrouching = true;
+    }
+
     this.camera.position.copy(this.playerPos);
     this.camera.rotation.order = 'YXZ';
     this.camera.rotation.set(0, 0, 0);
     this.camera.rotation.y = this.yaw;
     this.camera.rotation.x = this.pitch;
-    this.camera.rotation.z = 0;
+    this.camera.rotation.z = this.isSliding ? -0.035 : 0;
 
     const wDef = WEAPONS[this.currentWeaponId];
-    const targetFov = this.isAiming ? 80 * wDef.adsZoom : 80;
+    let targetFov = this.isAiming ? 80 * wDef.adsZoom : 80;
+    if (this.isSliding) {
+      targetFov += 4;
+    }
     this.camera.fov = THREE.MathUtils.damp(this.camera.fov, targetFov, 16, delta);
     this.camera.updateProjectionMatrix();
 
-    const isMoving = _moveDir.lengthSq() > 0.05 && this.isGrounded;
-    this.viewModel.setSprinting(this.isSprinting);
+    const isMoving = (this.isSliding || _moveDir.lengthSq() > 0.05) && this.isGrounded;
+    this.viewModel.setSprinting(this.isSprinting && !this.isSliding);
     this.viewModel.update(delta, isMoving, this.isAiming);
   }
 

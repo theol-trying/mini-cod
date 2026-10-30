@@ -140,7 +140,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
               <div className="flex justify-between p-2 rounded bg-neutral-900/60 border border-neutral-850">
                 <span className="text-neutral-400">S'accroupir :</span>
-                <span className="font-bold text-white">[C] ou Ctrl</span>
+                <span className="font-bold text-amber-300">[C] ou Ctrl</span>
+              </div>
+              <div className="flex justify-between p-2 rounded bg-neutral-900/60 border border-neutral-850">
+                <span className="text-neutral-400">Glissade Tactique :</span>
+                <span className="font-bold text-amber-300">[C] pendant Sprint</span>
               </div>
               <div className="flex justify-between p-2 rounded bg-neutral-900/60 border border-neutral-850">
                 <span className="text-neutral-400">Coup de Couteau :</span>
